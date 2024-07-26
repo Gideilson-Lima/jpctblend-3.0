@@ -1,13 +1,22 @@
 package com.andresjesse.jpctblendae;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.StringWriter;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.stream.Collectors;
 
+import javax.microedition.khronos.opengles.GL;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
@@ -19,13 +28,21 @@ import org.w3c.dom.NodeList;
 import org.xml.sax.SAXException;
 
 import android.content.res.AssetManager;
+import android.opengl.GLES20;
 import android.util.Log;
 
+import com.andresjesse.jpctblendae.actors.Player;
+import com.lima.gui.ChildCamera;
+import com.lima.gui.Text;
+import com.threed.jpct.Camera;
+import com.threed.jpct.Config;
+import com.threed.jpct.GLSLShader;
 import com.threed.jpct.Light;
 import com.threed.jpct.Loader;
 import com.threed.jpct.Object3D;
 import com.threed.jpct.SimpleVector;
 import com.threed.jpct.Texture;
+import com.threed.jpct.TextureInfo;
 import com.threed.jpct.TextureManager;
 import com.threed.jpct.World;
 
@@ -37,9 +54,10 @@ import com.threed.jpct.World;
  * 
  */
 public class JPCTBlendScene {
-	private static final int IMPORTER_VERSION = 2;
+	private static final int IMPORTER_VERSION = 3;
 
 	private boolean active = false;
+
 	
 	//rotation pivots are reseted in build() method,
 	//they are corrected in first "JPCTBlend.update()"
@@ -57,10 +75,12 @@ public class JPCTBlendScene {
 	private ArrayList<CameraInfo> cameras;
 	private ArrayList<IActor> actors;
 	private SimpleVector ambientLight;
+	private GLSLShader shader = null;
 
 	// Scene World and AssetsManager
 	private World world;
 	private AssetManager assets;
+	private LoadListener listener;
 
 	/**
 	 * JPCTScene constructor, loads an scene based on the main xml file
@@ -69,10 +89,11 @@ public class JPCTBlendScene {
 	 * @param sceneFilename
 	 *            scene xml filename
 	 */
-	public JPCTBlendScene(String sceneFilename, AssetManager assets, World world) {
+	public JPCTBlendScene(String sceneFilename, AssetManager assets, World world, LoadListener listener) {
 		this.assets = assets;
 		this.world = world;
-		
+		this.listener = listener;
+
 		//add assets reference in ActorManager
 		ActorFactory.getInstance().setAssetsManager(assets);
 		
@@ -101,6 +122,9 @@ public class JPCTBlendScene {
 		addSceneToWorld();
 	}
 
+	public void replaceDefaultCamera(ChildCamera newCamera){
+		world.setCameraTo(newCamera);
+	}
 	/**
 	 * Adds everything to the world.
 	 */
@@ -127,7 +151,7 @@ public class JPCTBlendScene {
 
 			world.getCamera().setPosition(currentCameraInfo.getPosition());
 			world.getCamera().lookAt(currentCameraInfo.getLookAt());
-			
+
 			// FOV tip, by juan from JPCT forum.
 			// http://www.jpct.net/forum2/index.php/topic,3711.0.html
 			world.getCamera().setFOV(0.914f);
@@ -177,8 +201,8 @@ public class JPCTBlendScene {
 	/**
 	 * Parse all actors and return as list. All actors must be defined as Java
 	 * classes.
-	 * 
-	 * @param xmlInfo
+	 *
+	 * @param xmlActors
 	 *            actors xml root
 	 * @return all actors as list
 	 */
@@ -192,14 +216,19 @@ public class JPCTBlendScene {
 			if (node.getNodeType() == Node.ELEMENT_NODE
 					&& node.getNodeName().equals("actor")) {
 
-				IActor actor = ActorFactory.getInstance().createFromString(
-						getAttrValue("javaclass", node));
+				String name = getAttrValue("javaclass",node);
+
+				IActor actor = ActorFactory.getInstance().createFromString(name);
 
 				if (actor != null) {
 					actor.setPosition(getAttrValueSimpleVector("position", node));
 					actor.setRotation(getAttrValueSimpleVector("rotation", node));
-
 					actorsList.add(actor);
+
+					if(name.equals("Player")){
+						Player p = (Player) actor;
+						listener.onLoadPlayer(p);
+					}
 				}
 			}
 		}
@@ -213,7 +242,7 @@ public class JPCTBlendScene {
 	 * be possible to add all of them in blender and "switch" or create paths
 	 * (for cutscenes) here in jpct.
 	 * 
-	 * @param xmlInfo
+	 * @param xmlCameras
 	 *            cameras xml root
 	 * @return all cameras info as list
 	 */
@@ -242,6 +271,11 @@ public class JPCTBlendScene {
 						xmlInfo));
 	}
 
+	private static String convertToString(InputStream is){
+		Scanner s = new Scanner(is).useDelimiter("\\A");
+		return s.hasNext() ? s.next() : "";
+	}
+
 	/**
 	 * Loads all meshs and add them to the MeshsManager. Also returns a a list
 	 * of configured (pos/rot/scale/texture) Object3D's.
@@ -260,32 +294,31 @@ public class JPCTBlendScene {
 			if (node.getNodeType() == Node.ELEMENT_NODE
 					&& node.getNodeName().equals("instance")) {
 
-				String meshFile = getAttrValue("mesh_name", node) + ".3ds";
+				String meshFile = getAttrValue("mesh_name", node) + ".obj";
 
+				Object3D[] tmp;
 				Object3D obj = null;
 
-				// If object not loaded: load and use, else: clone and use
-				if (!Object3DManager.getInstance().containsObject3D(meshFile)) {
-					// try to load resource from assets folder.
-					InputStream is = null;
-					try {
-						is = assets.open(sceneBasePath + "meshs"
-								+ File.separator + meshFile);
-					} catch (IOException e) {
-						e.printStackTrace();
-					}
-					// Configured blender to export one object per file, so
-					// loads just index [0]
-					obj = Loader.load3DS(is, 1.0f)[0];
-					Object3DManager.getInstance().putObject3D(meshFile, obj);
-				} else {
-					obj = Object3DManager.getInstance().cloneObject3D(meshFile);
+				// Configured blender to export one object per file, so
+				// loads just index [0]
+
+
+				try {
+					tmp = Loader.loadOBJ(assets.open(sceneBasePath + "meshs" + File.separator
+							+ meshFile),null, 1.0f);
+					obj = Object3D.mergeAll(tmp);
+				} catch (IOException e) {
+					e.printStackTrace();
 				}
+
+
+				Object3DManager.getInstance().putObject3D(meshFile, obj);
 
 				obj.translate(getAttrValueSimpleVector("position", node));
 
 				SimpleVector rot = getAttrValueSimpleVector("rotation", node);
 
+				obj.setCollisionMode(Object3D.COLLISION_CHECK_OTHERS);
 				obj.rotateX(rot.x);
 				obj.rotateY(rot.y);
 				obj.rotateZ(rot.z);
@@ -295,19 +328,74 @@ public class JPCTBlendScene {
 				// disabled for now..
 				// obj.scale(getAttrValueSimpleVector("scale", node).x);
 
+				Map<String,Integer> dic = new HashMap<>();
+				dic.put("R channel",0);
+				dic.put("G channel",1);
+				dic.put("B channel",2);
+				dic.put("A channel",3);
+				dic.put("Map",4);
+				dic.put("Base Color",5);
+				Log.d("shader","resize map test");
 				String textureName = getAttrValue("texture", node);
-				obj.setTexture(textureName);
+				String texturesList[] = textureName.split(",");
 
-				//alpha to "png" textures
-				if (textureName.length() > 3) {
+				TextureManager tm = TextureManager.getInstance();
+				if(texturesList.length>1){
+					Arrays.sort(texturesList,(a,b) -> {
+						int intA = dic.get(a.split(":")[0]);
+						int intB = dic.get(b.split(":")[0]);
 
-					String ext = getAttrValue("texture", node).substring(
-							textureName.length() - 3, textureName.length());
+						return Integer.compare(intA,intB);
+					});
+					String[] tag = texturesList[0].split(":");
 
-					if (ext.equals("png"))
-						obj.setTransparency(10);
+					//TODO: create a method to combine de channels
+					int texID = tm.getTextureID(tag[1]);
+					TextureInfo ti = new TextureInfo(texID);
+
+					String vertexShader = null, fragmentShader=null;
+					try {
+						vertexShader = Loader.loadTextFile(assets.open("shaders/vertexshader_offset.glsl"));
+						fragmentShader = Loader.loadTextFile(assets.open("shaders/fragmentshader_offset.glsl"));
+					}catch (IOException e){}
+					shader = new GLSLShader(vertexShader, fragmentShader);
+					shader.setStaticUniform("invRadius", 0.003f);
+					for (int j=1;j<texturesList.length;j++){
+						tag = texturesList[j].split(":");
+						texID= tm.getTextureID(tag[1]);
+						ti.add(texID, TextureInfo.MODE_MODULATE);
+						Log.d("shader", "Added texture: " + tag[1] + " with ID: " + texID + " at stage: " + j);
+					}
+
+					Log.d("shader","textures count "+texturesList.length+" max phys tex "+TextureInfo.MAX_PHYSICAL_TEXTURE_STAGES);
+
+					obj.setTexture(ti);
+					obj.build();
+					obj.setSpecularLighting(true);
+					obj.setShader(shader);
+					obj.setCulling(false);
+
+				}else{
+					String vertexShader = null, fragmentShader=null;
+					try {
+						vertexShader = Loader.loadTextFile(assets.open("shaders/vertexshader_offset.glsl"));
+						fragmentShader = Loader.loadTextFile(assets.open("shaders/fragmentshader_general.glsl"));
+					}catch (IOException e){}
+					shader = new GLSLShader(vertexShader, fragmentShader);
+					shader.setStaticUniform("invRadius", 0.01f);
+					String texName = texturesList[0].split(":")[1];
+					obj.setTexture(texName);
+					Log.d("SingleTexName",texName);
+					//alpha to "png" textures
+					if (texName.length() > 3) {
+						String ext = texName.substring(texName.length() - 3);
+
+						//if (ext.equals("png"))
+							//obj.setTransparency(10);
+					}
+					obj.build();
 				}
-
+				Log.d("Nothing","");
 				instancesList.add(obj);
 			}
 		}
@@ -338,16 +426,18 @@ public class JPCTBlendScene {
 
 				SimpleVector intensity = getAttrValueSimpleVector("rgbcolor",
 						node);
-				intensity.scalarMul(getAttrValueFloat("distance", node) * 200f);// experimental
-																				// param
+				float power = getAttrValueFloat("power",node),
+				distance = getAttrValueFloat("distance",node);
 
+				float energy = power / distance;
+				intensity.scalarMul(energy*0.5f);// experimental
+																				// param
 				light.setIntensity(intensity);
 				
-				light.setAttenuation(getAttrValueFloat("distance", node) * 0.2f);// experimental
+				//light.setAttenuation(distance*1.5f);// experimental
 																					// param
-				light.setDiscardDistance(getAttrValueFloat("distance", node) * 1.5f);// experimental
+				light.setDiscardDistance(distance);// experimental
 																						// param
-
 				listLights.add(light);
 			}
 
@@ -398,8 +488,8 @@ public class JPCTBlendScene {
 				Log.d("jb", sceneBasePath + "textures" + File.separator
 						+ txName);
 
-				Texture newTx = new Texture(is);
-
+				Texture newTx = new Texture(is,true);
+				newTx.setMipmap(true);
 				TextureManager.getInstance().addTexture(txName, newTx);
 				listTextures.add(txName);
 			}
