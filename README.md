@@ -30,8 +30,6 @@ Main Goals:
 - [x] Add Android  (JPCT-AE) support;
 - [x] Convert python to a real Blender exporter plugin;
 - [x] Export Blender Texture Flags (png's are loaded with alpha channel);
-- [ ] Add Support to Packed Textures (Blender Exporter);
-- [ ] Add Support for GLSL Shaders (Blender -> JPCT)
 
 What is Working:
 
